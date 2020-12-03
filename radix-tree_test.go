@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"github.com/google/btree"
 	"github.com/shirou/gopsutil/process"
 	"io"
 	"io/ioutil"
@@ -287,6 +288,73 @@ func TestReloadRtree(t *testing.T) {
 	m, _ := p.MemoryInfo()
 	fmt.Println("MemoryInfo", m.RSS>>20)
 }
+
+type text []byte
+
+func newText(data []byte) text {
+	t := make([]byte, len(data))
+	copy(t, data)
+	return t
+}
+func (t text) Less(than btree.Item) bool {
+	return bytes.Compare(t, than.(text)) < 0
+}
+
+func TestBtree(t *testing.T) {
+	tree := btree.New(3)
+	f, err := os.Open("../files.txt")
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	scanner := bufio.NewScanner(bufio.NewReader(f))
+	var count int
+	begin := time.Now()
+	for ; scanner.Scan(); {
+		text := scanner.Bytes()
+		if len(text) > 0 {
+			tree.ReplaceOrInsert(newText(text))
+			count++
+		}
+		if count%100000 == 0 {
+			fmt.Println(count, int(float64(count)/time.Now().Sub(begin).Seconds()))
+		}
+	}
+	f.Close()
+	fmt.Println("done ", count)
+	fmt.Println("insert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
+
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	runtime.GC()
+	m, _ := p.MemoryInfo()
+	fmt.Println(m.RSS >> 20)
+
+	data, _ := ioutil.ReadFile("../files.txt")
+
+	count = 0
+	tokens := bytes.Split(data, []byte("\n"))
+	begin = time.Now()
+	for _, str := range tokens {
+		if len(str) > 0 {
+			if tree.Get(text(str)) == nil {
+				t.Errorf("no find key:%v", str)
+			}
+			count++
+		}
+		if count%100000 == 0 {
+			fmt.Println(int(float64(count) / time.Now().Sub(begin).Seconds()))
+		}
+	}
+	fmt.Println("find done ", count)
+	fmt.Println("find/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
+}
+
+/*
+insert/s 1269929
+find/s 1965258
+*/
 
 func TestLoadFile(t *testing.T) {
 	f, err := os.Open("../files.txt")
