@@ -21,6 +21,10 @@ type RTree struct {
 	children Children
 }
 
+func New() *RTree {
+	return &RTree{}
+}
+
 func newRNode(prefix []byte, key bool) *RNode {
 	return &RNode{
 		key:    key,
@@ -75,35 +79,28 @@ func (children *Children) deleteAt(index int) {
 
 func (children *Children) delete(key []byte) {
 	if index, child := children.FindNode(key[0]); child != nil {
-		if bytes.Compare(child.prefix, key) == 0 {
+		if len(key) < len(child.prefix) ||
+			bytes.Compare(key[:len(child.prefix)], child.prefix) != 0 {
+			return
+		}
+		if len(child.prefix) == len(key) {
 			if len(child.children) == 0 {
 				children.deleteAt(index - 1)
-				return
 			} else {
 				if len(child.children) == 1 {
-					prefix := make([]byte, len(child.prefix)+len(child.children[0].prefix))
-					child.key = child.children[0].key
-					copy(prefix, child.prefix)
-					copy(prefix[len(child.prefix):], child.children[0].prefix)
-					child.children = child.children[0].children
+					child.merge()
 				} else {
 					child.key = false
 				}
-				return
 			}
+			return
 		}
-		if child.children == nil {
+		if len(child.children) == 0 {
 			return
 		}
 		child.children.delete(key[len(child.prefix):])
-		//merge
 		if len(child.children) == 1 && child.key == false {
-			//fmt.Println("-- merge -- ")
-			prefix := make([]byte, len(child.prefix)+len(child.children[0].prefix))
-			child.key = child.children[0].key
-			copy(prefix, child.prefix)
-			copy(prefix[len(child.prefix):], child.children[0].prefix)
-			child.children = child.children[0].children
+			child.merge()
 		}
 	}
 }
@@ -206,6 +203,15 @@ func (node *RNode) insert(key []byte) {
 	}
 }
 
+func (node *RNode) merge() {
+	prefix := make([]byte, len(node.prefix)+len(node.children[0].prefix))
+	node.key = node.children[0].key
+	copy(prefix, node.prefix)
+	copy(prefix[len(node.prefix):], node.children[0].prefix)
+	node.prefix = prefix
+	node.children = node.children[0].children
+}
+
 type stackItem struct {
 	*RNode
 	visit bool
@@ -267,10 +273,10 @@ func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 			} else {
 				size += int64(n)
 			}
-		}
-		if visit == false && item.children != nil {
-			stack.push(item.children)
-			continue
+			if item.children != nil {
+				stack.push(item.children)
+				continue
+			}
 		}
 		stack.pop()
 		if n, err := writer.Write(popText); err != nil {
@@ -288,7 +294,7 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 	var stack = make([]*Children, 0, 128)
 	var curr *Children
 	var scanner = bufio.NewScanner(reader)
-	var tokens = make(chan [][]byte, 4<<10)
+	var tokensCh = make(chan [][]byte, 4<<10)
 	var buffer = make([][]byte, 0, bufferSize)
 
 	go func() {
@@ -300,16 +306,14 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 			if len(buffer) < bufferSize {
 				continue
 			}
-			tokens <- buffer
+			tokensCh <- buffer
 			buffer = make([][]byte, 0, bufferSize)
 		}
-		if len(buffer) != 0 {
-			tokens <- buffer
-		}
-		close(tokens)
+		tokensCh <- buffer
+		close(tokensCh)
 	}()
-	for token := range tokens {
-		for _, token := range token {
+	for tokens := range tokensCh {
+		for _, token := range tokens {
 			if token[0] == PushKey || token[0] == Push {
 				if len(stack) == 0 {
 					stack = append(stack, &tree.children)
@@ -323,12 +327,14 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 				next := newRNode(token[1:], token[0] == PushKey)
 				*curr = append(*curr, next)
 				curr = &next.children
-			} else {
+			} else if token[0] == Pop {
 				if len(stack) == 0 {
 					return nil, fmt.Errorf("stack error")
 				}
 				curr = stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
+			} else {
+				return nil, fmt.Errorf("unkown token %c", token[0])
 			}
 		}
 	}
@@ -350,11 +356,13 @@ func BuildTree(reader io.Reader) (*RTree, error) {
 			if text[0] == PushKey {
 				tree.Insert([]byte(strings.Join(stack, "")))
 			}
-		} else {
+		} else if text[0] == Pop {
 			if len(stack) == 0 {
 				return nil, fmt.Errorf("stack error")
 			}
 			stack = stack[:len(stack)-1]
+		} else {
+			return nil, fmt.Errorf("unkown token %c", text[0])
 		}
 	}
 	if len(stack) != 0 {

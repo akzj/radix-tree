@@ -13,10 +13,8 @@ import (
 	"reflect"
 	"runtime"
 	sort "sort"
-	"strings"
 	"testing"
 	"time"
-	"unsafe"
 )
 
 func printTokens(bytesTokens [][]byte) {
@@ -96,6 +94,7 @@ func TestChildrenDelete(t *testing.T) {
 		})
 		fmt.Println("---------------")
 		for _, val := range Case.keys {
+			fmt.Println("delete", val)
 			tree.Delete([]byte(val))
 		}
 		tree.Walk(func(prefixes [][]byte) bool {
@@ -121,10 +120,13 @@ func TestWriteRBtreeDelete(t *testing.T) {
 	f.Close()
 	f = nil
 	scanner = nil
+	begin := time.Now()
+	count := len(keys)
 	for str, key := range keys {
 		tree.Delete([]byte(key))
 		delete(keys, str)
 	}
+	fmt.Println("delete/s ", int(float64(count)/time.Now().Sub(begin).Seconds()))
 	tree.Walk(func(prefixes [][]byte) bool {
 		printTokens(prefixes)
 		return true
@@ -405,35 +407,6 @@ func TestLoadFile(t *testing.T) {
 	}
 	fmt.Println("find done ", count)
 	fmt.Println("find/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
-}
-
-func CopyString(s string) string {
-	return CopyStringN(s, 0, len(s))
-}
-
-func CopyStringN(s string, offset, length int) string {
-	buf := make([]byte, length)
-	copy(buf, s[offset:])
-	return *(*string)(unsafe.Pointer(&buf))
-}
-
-func TestStringCopy(t *testing.T) {
-	var texts []string
-	for i := 0; i < 10000; i++ {
-		text := strings.Repeat("s", 10000)
-		//texts = append(texts, text)
-		texts = append(texts, text[:1])
-		//texts = append(texts, CopyString(text, 10))
-		//texts = append(texts, text)
-	}
-
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	runtime.GC()
-	m, _ := p.MemoryInfo()
-	fmt.Println(m.RSS >> 20)
 }
 
 /*
