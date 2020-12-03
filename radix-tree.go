@@ -12,7 +12,6 @@ import (
 type Children []*RNode
 
 type RNode struct {
-	visit    bool
 	key      bool
 	children Children
 	prefix   []byte
@@ -196,7 +195,7 @@ func (node *RNode) insert(key []byte) {
 		node.key = false
 		key = key[index:]
 		if len(key) > 0 {
-			k := make([]byte,len(key))
+			k := make([]byte, len(key))
 			copy(k, key)
 			rNode := newRNode(k, true)
 			index, _ := node.children.FindNode(key[0])
@@ -207,11 +206,16 @@ func (node *RNode) insert(key []byte) {
 	}
 }
 
-type Stack struct {
-	stack Children
+type stackItem struct {
+	*RNode
+	visit bool
 }
 
-func (s *Stack) peek() *RNode {
+type stack struct {
+	stack []*stackItem
+}
+
+func (s *stack) peek() *stackItem {
 	if len(s.stack) == 0 {
 		return nil
 	}
@@ -219,7 +223,7 @@ func (s *Stack) peek() *RNode {
 	return rNode
 }
 
-func (s *Stack) pop() *RNode {
+func (s *stack) pop() *stackItem {
 	if len(s.stack) == 0 {
 		return nil
 	}
@@ -228,9 +232,9 @@ func (s *Stack) pop() *RNode {
 	return rNode
 }
 
-func (s *Stack) push(children Children) {
+func (s *stack) push(children Children) {
 	for i := len(children) - 1; i >= 0; i-- {
-		s.stack = append(s.stack, children[i])
+		s.stack = append(s.stack, &stackItem{RNode: children[i]})
 	}
 }
 
@@ -240,22 +244,23 @@ const (
 	Pop     = '-'
 )
 
-func (tree RTree) WriteTo(writer io.Writer) (int64, error) {
+func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 	var size int64
-	var stack = Stack{}
+	var stack = stack{}
 	var text bytes.Buffer
+	var popText = []byte{Pop, '\n'}
 	stack.push(tree.children)
-	for rNode := stack.peek(); rNode != nil; rNode = stack.peek() {
-		visit := rNode.visit
-		rNode.visit = true
+	for item := stack.peek(); item != nil; item = stack.peek() {
+		visit := item.visit
+		item.visit = true
 		if visit == false {
 			text.Reset()
-			if rNode.key {
+			if item.key {
 				text.WriteByte(PushKey)
 			} else {
 				text.WriteByte(Push)
 			}
-			text.Write(rNode.prefix)
+			text.Write(item.prefix)
 			text.WriteByte('\n')
 			if n, err := writer.Write(text.Bytes()); err != nil {
 				return 0, err
@@ -263,12 +268,12 @@ func (tree RTree) WriteTo(writer io.Writer) (int64, error) {
 				size += int64(n)
 			}
 		}
-		if visit == false && rNode.children != nil {
-			stack.push(rNode.children)
+		if visit == false && item.children != nil {
+			stack.push(item.children)
 			continue
 		}
 		stack.pop()
-		if n, err := writer.Write([]byte(string(Pop) + "\n")); err != nil {
+		if n, err := writer.Write(popText); err != nil {
 			return 0, err
 		} else {
 			size += int64(n)
@@ -319,6 +324,9 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 				*curr = append(*curr, next)
 				curr = &next.children
 			} else {
+				if len(stack) == 0 {
+					return nil, fmt.Errorf("stack error")
+				}
 				curr = stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
 			}
@@ -343,6 +351,9 @@ func BuildTree(reader io.Reader) (*RTree, error) {
 				tree.Insert([]byte(strings.Join(stack, "")))
 			}
 		} else {
+			if len(stack) == 0 {
+				return nil, fmt.Errorf("stack error")
+			}
 			stack = stack[:len(stack)-1]
 		}
 	}
