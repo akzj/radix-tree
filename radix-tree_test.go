@@ -3,11 +3,10 @@ package rtree
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
+	"crypto/md5"
 	"fmt"
 	"github.com/google/btree"
 	"github.com/shirou/gopsutil/process"
-	"io"
 	"io/ioutil"
 	"os"
 	"reflect"
@@ -16,7 +15,6 @@ import (
 	"testing"
 	"time"
 )
-
 
 func printMemUsed() {
 	p, err := process.NewProcess(int32(os.Getpid()))
@@ -37,7 +35,7 @@ func TestInsert(t *testing.T) {
 	for _, it := range keys {
 		tree.Insert([]byte(it))
 	}
-	tree.Walk(func(prefixes [][]byte) bool {
+	tree.Walk(func(prefixes [][]byte, _ interface{}) bool {
 		printTokens(prefixes)
 		return true
 	})
@@ -47,12 +45,13 @@ func TestInsert(t *testing.T) {
 
 	clone.Insert([]byte("acccb"))
 	clone.Insert([]byte("bcccb"))
-	clone.Walk(func(prefixes [][]byte) bool {
+	clone.Walk(func(prefixes [][]byte, obj interface{}) bool {
 		printTokens(prefixes)
+		fmt.Println(obj)
 		return true
 	})
 	print("-----------\n")
-	tree.Walk(func(prefixes [][]byte) bool {
+	tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 		printTokens(prefixes)
 		return true
 	})
@@ -66,7 +65,7 @@ func TestRTreeDeleteMerge(t *testing.T) {
 	tree.Insert([]byte("aaacccbbb"))
 	tree.Insert([]byte("aaacccddd"))
 
-	tree.Walk(func(prefixes [][]byte) bool {
+	tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 		printTokens(prefixes)
 		return true
 	})
@@ -76,7 +75,7 @@ func TestRTreeDeleteMerge(t *testing.T) {
 	tree.Delete([]byte("aaacccbbb"))
 	tree.Delete([]byte("aaabbb"))
 
-	tree.Walk(func(prefixes [][]byte) bool {
+	tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 		printTokens(prefixes)
 		return true
 	})
@@ -102,7 +101,7 @@ func TestChildrenDelete(t *testing.T) {
 			fmt.Println(string(val))
 			tree.Insert([]byte(val))
 		}
-		tree.Walk(func(prefixes [][]byte) bool {
+		tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 			printTokens(prefixes)
 			return true
 		})
@@ -111,7 +110,7 @@ func TestChildrenDelete(t *testing.T) {
 			fmt.Println("delete", val)
 			tree.Delete([]byte(val))
 		}
-		tree.Walk(func(prefixes [][]byte) bool {
+		tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 			printTokens(prefixes)
 			return true
 		})
@@ -144,14 +143,14 @@ func TestWriteRBtreeDelete(t *testing.T) {
 		keys[index] = nil
 	}
 	fmt.Println("delete/s ", int(float64(count)/time.Now().Sub(begin).Seconds()))
-	tree.Walk(func(prefixes [][]byte) bool {
+	tree.Walk(func(prefixes [][]byte, obj interface{}) bool {
 		printTokens(prefixes)
 		return true
 	})
 	printMemUsed()
 }
 
-func TestChildrenInsert(t *testing.T) {
+func TestChildrenInsertFindRebuildWrite(t *testing.T) {
 
 	cases := []struct {
 		keys []string
@@ -184,44 +183,57 @@ func TestChildrenInsert(t *testing.T) {
 	for _, Case := range cases {
 		vals := Case.keys
 		var tree = New()
-		for _, val := range vals {
-			tree.Insert([]byte(val))
-		}
-		var result []string
-		tree.Walk(func(key [][]byte) bool {
-			result = append(result, string(bytes.Join(key, nil)))
-			printTokens(key)
-			return true
-		})
-		sort.Strings(result)
-		sort.Strings(vals)
-		if reflect.DeepEqual(result, vals) == false {
-			t.Errorf("test case failed \n%+v,\n%+v", result, vals)
-		}
-		for _, val := range vals {
-			if tree.Find([]byte(val)) == false {
-				t.Errorf("no find key:%s", val)
+		t.Run("Insert", func(t *testing.T) {
+			for _, val := range vals {
+				tree.Insert([]byte(val))
 			}
-		}
-		tree.Walk(func(prefixes [][]byte) bool {
-			printTokens(prefixes)
-			return true
 		})
-		var buffer bytes.Buffer
-		tree.WriteTo(&buffer)
-
-		fmt.Println("---------------")
-		fmt.Println(buffer.String())
-		fmt.Println("---------------")
-
-		if tree2, err := FastBuildTree(&buffer); err == nil {
-			tree2.Walk(func(prefixes [][]byte) bool {
-				printTokens(prefixes)
+		var result []string
+		t.Run("Walk", func(t *testing.T) {
+			tree.Walk(func(key [][]byte, obj interface{}) bool {
+				result = append(result, string(bytes.Join(key, nil)))
 				return true
 			})
-		} else {
-			t.Errorf(err.Error())
-		}
+			sort.Strings(result)
+			sort.Strings(vals)
+			if reflect.DeepEqual(result, vals) == false {
+				t.Errorf("test case failed \n%+v,\n%+v", result, vals)
+			}
+		})
+		t.Run("find", func(t *testing.T) {
+			for _, val := range vals {
+				if tree.Find([]byte(val)) == false {
+					t.Errorf("no find value:%s", val)
+				}
+			}
+		})
+		var buffer bytes.Buffer
+		t.Run("WriteTo", func(t *testing.T) {
+			_, err := tree.WriteTo(&buffer, func(obj interface{}) ([]byte, error) {
+				return obj.([]byte), nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		t.Run("ReBuildTree", func(t *testing.T) {
+			if tree2, err := ReBuildTree(&buffer, func(data []byte) (interface{}, error) {
+				return data, nil
+			}); err == nil {
+				var result2 []string
+				tree2.Walk(func(prefixes [][]byte, obj interface{}) bool {
+					result2 = append(result2, string(bytes.Join(prefixes, nil)))
+					return true
+				})
+				sort.Strings(result2)
+				if reflect.DeepEqual(result2, result) == false {
+					t.Fatalf("%+v\n%+v\n", result, result2)
+				}
+			} else {
+				t.Errorf(err.Error())
+			}
+		})
 	}
 }
 
@@ -239,40 +251,56 @@ func TestWriteRBtree(t *testing.T) {
 	f.Close()
 
 	begin := time.Now()
-	var buffer bytes.Buffer
-	if _, err := tree.WriteTo(&buffer); err != nil {
-		t.Fatal(err)
-	}
-	fmt.Printf("WriteTo tree token seconds %0.3f\n", time.Now().Sub(begin).Seconds())
-	if err := ioutil.WriteFile("rtree.stack", buffer.Bytes(), 0666); err != nil {
+	out, err := os.Create("rtree.stack.gz")
+	if err != nil {
 		t.Fatal(err.Error())
 	}
+	if _, err := tree.WriteToWithGzip(out, func(obj interface{}) ([]byte, error) {
+		return obj.([]byte), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("WriteToWithGzip token seconds %0.3f\n", time.Now().Sub(begin).Seconds())
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	writeString := func(tree *RTree, filename string) {
+	var hash string
+	var hash2 string
+	writeString := func(tree *Tree, filename string) string {
 		begin := time.Now()
 		defer func() {
-			fmt.Printf("write tree token seconds %0.3f", time.Now().Sub(begin).Seconds())
+			fmt.Printf("Walk token seconds %0.3f\n", time.Now().Sub(begin).Seconds())
 		}()
 		var buffer bytes.Buffer
-		tree.Walk(func(prefixes [][]byte) bool {
+		tree.Walk(func(prefixes [][]byte, _ interface{}) bool {
 			buffer.Write(append(bytes.Join(prefixes, nil), '\n'))
 			return true
 		})
 		if err := ioutil.WriteFile(filename, buffer.Bytes(), 0666); err != nil {
 			t.Fatal(err.Error())
 		}
+		return fmt.Sprintf("%+x", md5.Sum(buffer.Bytes()))
 	}
-	writeString(tree, "stack.txt")
+	hash = writeString(tree, "stack.txt")
 	{
-		f, err := os.Open("rtree.stack")
+		f, err := os.Open("rtree.stack.gz")
 		if err != nil {
 			t.Fatal(err.Error())
 		}
-		tree, err := FastBuildTree(f)
+		begin := time.Now()
+		tree, err := ReBuildTreeWithGzip(f, func(data []byte) (interface{}, error) {
+			return data, nil
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		writeString(tree, "stack.txt2")
+		fmt.Printf("ReBuildTreeWithGzip token seconds %0.3f\n", time.Now().Sub(begin).Seconds())
+		hash2 = writeString(tree, "stack.txt2")
+	}
+
+	if hash != hash2 {
+		t.Fatal("ReBuildTreeWithGzip failed")
 	}
 
 }
@@ -289,12 +317,14 @@ take time seconds 8.639--- PASS: TestReloadRtree (8.64s)
 PASS
 */
 func TestReloadRtree(t *testing.T) {
-	f, err := os.Open("rtree.stack")
+	f, err := os.Open("rtree.stack.gz")
 	if err != nil {
 		t.Fatal(err.Error())
 	}
 	begin := time.Now()
-	if _, err := FastBuildTree(bufio.NewReaderSize(f, 1<<20)); err != nil {
+	if _, err := ReBuildTreeWithGzip(bufio.NewReaderSize(f, 1<<20), func(data []byte) (interface{}, error) {
+		return data[0], nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	fmt.Printf("take time seconds %0.3f\n", time.Now().Sub(begin).Seconds())
@@ -330,7 +360,7 @@ func TestBtree(t *testing.T) {
 	}
 	f.Close()
 	fmt.Println("done ", count)
-	fmt.Println("insert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
+	fmt.Println("replaceOrInsert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
 
 	printMemUsed()
 
@@ -342,7 +372,7 @@ func TestBtree(t *testing.T) {
 	for _, str := range tokens {
 		if len(str) > 0 {
 			if tree.Get(text(str)) == nil {
-				t.Errorf("no find key:%v", str)
+				t.Errorf("no find value:%v", str)
 			}
 			count++
 		}
@@ -355,7 +385,7 @@ func TestBtree(t *testing.T) {
 }
 
 /*
-insert/s 1269929
+replaceOrInsert/s 1269929
 find/s 1965258
 */
 
@@ -378,9 +408,8 @@ func TestLoadFile(t *testing.T) {
 	}
 	f.Close()
 	fmt.Println("done ", count)
-	fmt.Println("insert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
+	fmt.Println("replaceOrInsert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
 	printMemUsed()
-
 
 	data, _ := ioutil.ReadFile("../files.txt")
 
@@ -390,7 +419,7 @@ func TestLoadFile(t *testing.T) {
 	for _, str := range tokens {
 		if len(str) > 0 {
 			if tree.Find(str) == false {
-				t.Errorf("no find key:%v", str)
+				t.Errorf("no find value:%v", str)
 			}
 			count++
 		}
@@ -423,28 +452,6 @@ func BenchmarkAppend(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		buffer := make([]byte, 64)
 		buffer = append(buffer, data...)
-	}
-}
-
-func TestGzipTest(t *testing.T) {
-	out, err := os.Create("files.gz")
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	writer := gzip.NewWriter(out)
-
-	in, err := os.Open("../files.txt")
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	if _, err := io.Copy(writer, in); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
 	}
 }
 

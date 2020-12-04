@@ -3,60 +3,62 @@ package rtree
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 	"sync"
 )
 
 type FreeList struct {
-	mx    sync.Mutex
+	mutex sync.Mutex
 	nodes []*node
 	size  int
 }
 
-type CopyOnWriteContext struct {
+type copyOnWriteContext struct {
 	freelist *FreeList
 }
 
 type children []*node
 
 type node struct {
-	key      bool
-	cow      *CopyOnWriteContext
+	value    interface{}
+	cow      *copyOnWriteContext
 	children children
 	prefix   []byte
 }
 
-type RTree struct {
-	cow      *CopyOnWriteContext
+type Tree struct {
+	cow      *copyOnWriteContext
 	children children
 }
 
 func NewFreeList(size int) *FreeList {
 	return &FreeList{
-		mx:    sync.Mutex{},
+		mutex: sync.Mutex{},
 		nodes: make([]*node, 0, size),
 		size:  size,
 	}
 }
 
-func (c *CopyOnWriteContext) newNode() *node {
+func (c *copyOnWriteContext) newNode() *node {
 	n := c.freelist.newNode()
 	n.cow = c
+
 	return n
 }
 
 func (freelist *FreeList) newNode() *node {
 	var n *node
-	freelist.mx.Lock()
+	freelist.mutex.Lock()
 	if size := len(freelist.nodes); size != 0 {
 		n = freelist.nodes[size-1]
 		freelist.nodes[size-1] = nil
 		freelist.nodes = freelist.nodes[:size-1]
 	}
-	freelist.mx.Unlock()
+	freelist.mutex.Unlock()
 	if n == nil {
 		return new(node)
 	}
@@ -64,22 +66,22 @@ func (freelist *FreeList) newNode() *node {
 }
 
 func (freelist *FreeList) freeNode(node *node) {
-	freelist.mx.Lock()
+	freelist.mutex.Lock()
 	if size := len(freelist.nodes); size < freelist.size {
 		freelist.nodes = append(freelist.nodes, node)
 	}
-	freelist.mx.Lock()
+	freelist.mutex.Lock()
 }
 
 var DefaultFreeListSize = 32
 
-func New() *RTree {
-	return &RTree{
-		cow: &CopyOnWriteContext{freelist: NewFreeList(DefaultFreeListSize)},
+func New() *Tree {
+	return &Tree{
+		cow: &copyOnWriteContext{freelist: NewFreeList(DefaultFreeListSize)},
 	}
 }
 
-func (tree *RTree) Clone() *RTree {
+func (tree *Tree) Clone() *Tree {
 	clone := *tree
 	cow1, cow2 := *tree.cow, *tree.cow
 	clone.children = make(children, len(tree.children))
@@ -89,10 +91,10 @@ func (tree *RTree) Clone() *RTree {
 	return &clone
 }
 
-func newRNode(cow *CopyOnWriteContext, prefix []byte, key bool) *node {
+func newRNode(cow *copyOnWriteContext, prefix []byte, value interface{}) *node {
 	n := cow.newNode()
 	n.prefix = prefix
-	n.key = key
+	n.value = value
 	return n
 }
 
@@ -126,7 +128,7 @@ func (children *children) deleteAt(index int) {
 	*children = (*children)[:len(*children)-1]
 }
 
-func (children *children) delete(cow *CopyOnWriteContext, key []byte) {
+func (children *children) delete(cow *copyOnWriteContext, key []byte) {
 	if index, child := children.findNode(key[0]); child != nil {
 		child = children.mutableChild(cow, index)
 		if len(key) < len(child.prefix) ||
@@ -141,7 +143,7 @@ func (children *children) delete(cow *CopyOnWriteContext, key []byte) {
 				if len(child.children) == 1 {
 					child.merge()
 				} else {
-					child.key = false
+					child.value = nil
 				}
 			}
 			return
@@ -150,13 +152,13 @@ func (children *children) delete(cow *CopyOnWriteContext, key []byte) {
 			return
 		}
 		child.children.delete(cow, key[len(child.prefix):])
-		if len(child.children) == 1 && child.key == false {
+		if len(child.children) == 1 && child.value == nil {
 			child.merge()
 		}
 	}
 }
 
-func (children *children) mutableChild(cow *CopyOnWriteContext, index int) *node {
+func (children *children) mutableChild(cow *copyOnWriteContext, index int) *node {
 	c := (*children)[index]
 	if c.cow != cow {
 		c = c.mutableFor(cow)
@@ -165,10 +167,10 @@ func (children *children) mutableChild(cow *CopyOnWriteContext, index int) *node
 	return c
 }
 
-func (children children) walk(stack [][]byte, f func(prefixes [][]byte) bool) bool {
+func (children children) walk(stack [][]byte, f func(prefixes [][]byte, value interface{}) bool) bool {
 	for _, child := range children {
-		if child.key {
-			if f(append(stack, child.prefix)) == false {
+		if child.value != nil {
+			if f(append(stack, child.prefix), child.value) == false {
 				return false
 			}
 		}
@@ -180,7 +182,7 @@ func (children children) walk(stack [][]byte, f func(prefixes [][]byte) bool) bo
 }
 
 func (n *node) find(key []byte) bool {
-	if n.key && bytes.Compare(n.prefix, key) == 0 {
+	if n.value != nil && bytes.Compare(n.prefix, key) == 0 {
 		return true
 	}
 	key = key[len(n.prefix):]
@@ -191,7 +193,7 @@ func (n *node) find(key []byte) bool {
 	}
 }
 
-func (tree *RTree) Find(key []byte) bool {
+func (tree *Tree) Find(key []byte) bool {
 	if tree.children == nil || len(key) == 0 {
 		return false
 	}
@@ -208,23 +210,38 @@ func bytesCopy(data []byte) []byte {
 	return out
 }
 
-func (tree *RTree) Insert(key []byte) {
+func (tree *Tree) ReplaceOrInsert(key []byte, val interface{}) interface{} {
+	if len(key) == 0 || val == nil {
+		return nil
+	}
+	index, child := tree.children.findNode(key[0])
+	if child == nil {
+		tree.children.insetAt(newRNode(tree.cow, key, val), index)
+	} else {
+		return tree.children.mutableChild(tree.cow, index).replaceOrInsert(key, val)
+	}
+	return nil
+}
+
+var Empty = []byte{'e', 'm', 'p', 't', 'y'}
+
+func (tree *Tree) Insert(key []byte) {
 	if len(key) == 0 {
 		return
 	}
 	index, child := tree.children.findNode(key[0])
 	if child == nil {
-		tree.children.insetAt(newRNode(tree.cow, key, true), index)
+		tree.children.insetAt(newRNode(tree.cow, key, Empty), index)
 	} else {
-		tree.children.mutableChild(tree.cow, index).insert(key)
+		tree.children.mutableChild(tree.cow, index).replaceOrInsert(key, Empty)
 	}
 }
 
-func (tree *RTree) Delete(key []byte) {
+func (tree *Tree) Delete(key []byte) {
 	tree.children.delete(tree.cow, key)
 }
 
-func (tree RTree) Walk(f func(prefixes [][]byte) bool) {
+func (tree Tree) Walk(f func(prefixes [][]byte, val interface{}) bool) {
 	tree.children.walk(make([][]byte, 0, 32), f)
 }
 
@@ -242,7 +259,7 @@ func prefixLen(k1, k2 []byte) int {
 	return i
 }
 
-func (n *node) mutableFor(cow *CopyOnWriteContext) *node {
+func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 	if n.cow == cow {
 		return n
 	}
@@ -256,7 +273,7 @@ func (n *node) mutableFor(cow *CopyOnWriteContext) *node {
 		copy(out.children, n.children)
 	}
 	out.prefix = bytesCopy(n.prefix)
-	out.key = n.key
+	out.value = n.value
 	return out
 }
 
@@ -274,44 +291,46 @@ func printTokens(bytesTokens [][]byte) {
 	fmt.Println(tokens)
 }
 
-func (n *node) insert(key []byte) {
+func (n *node) replaceOrInsert(key []byte, val interface{}) interface{} {
 	if bytes.Compare(n.prefix, key) == 0 {
-		if n.key == false {
-			n.key = true
-		} else {
-			//fmt.Println("repeated")
+		if n.value == nil {
+			n.value = val
+			return nil
 		}
-		return
+		old := n.value
+		n.value = val
+		return old
 	}
 	index := prefixLen(n.prefix, key)
 	if index == len(n.prefix) {
 		key = key[index:]
 		index, child := n.children.findNode(key[0])
 		if child == nil {
-			n.children.insetAt(newRNode(n.cow, bytesCopy(key), true), index)
+			n.children.insetAt(newRNode(n.cow, bytesCopy(key), val), index)
 		} else {
-			n.mutableChild(index).insert(key)
+			return n.mutableChild(index).replaceOrInsert(key, val)
 		}
 	} else {
 		child := *n
 		child.prefix = n.prefix[index:]
-		n.key = false
+		n.value = nil
 		n.prefix = n.prefix[:index]
 		n.children = make(children, 1, 2)
 		n.children[0] = &child
 		key = key[index:]
 		if len(key) > 0 {
 			index, _ := n.children.findNode(key[0])
-			n.children.insetAt(newRNode(n.cow, bytesCopy(key), true), index)
+			n.children.insetAt(newRNode(n.cow, bytesCopy(key), val), index)
 		} else {
-			n.key = true
+			n.value = val
 		}
 	}
+	return nil
 }
 
 func (n *node) merge() {
 	prefix := make([]byte, len(n.prefix)+len(n.children[0].prefix))
-	n.key = n.children[0].key
+	n.value = n.children[0].value
 	copy(prefix, n.prefix)
 	copy(prefix[len(n.prefix):], n.children[0].prefix)
 	n.prefix = prefix
@@ -362,25 +381,56 @@ const (
 	Pop     = '-'
 )
 
-func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
+func (tree *Tree) WriteToWithGzip(writer io.Writer, marshaler func(interface{}) ([]byte, error)) (int64, error) {
+	gzipWriter := gzip.NewWriter(writer)
+	n, err := tree.WriteTo(gzipWriter, marshaler)
+	if err != nil {
+		return 0, err
+	}
+	if err := gzipWriter.Flush(); err != nil {
+		return 0, err
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (tree *Tree) WriteTo(writer io.Writer, marshaler func(interface{}) ([]byte, error)) (int64, error) {
 	var size int64
 	var stack stack
-	var text bytes.Buffer
-	var popText = []byte{Pop, '\n'}
+	var buffer bytes.Buffer
+	var pop = []byte{Pop}
+	var lenBuf [4]byte
 	stack.push(tree.children...)
 	for item := stack.peek(); item != nil; item = stack.peek() {
 		visit := item.visit
 		item.visit = true
 		if visit == false {
-			text.Reset()
-			if item.key {
-				text.WriteByte(PushKey)
+			buffer.Reset()
+			if item.value != nil {
+				buffer.WriteByte(PushKey)
 			} else {
-				text.WriteByte(Push)
+				buffer.WriteByte(Push)
 			}
-			text.Write(item.prefix)
-			text.WriteByte('\n')
-			if n, err := writer.Write(text.Bytes()); err != nil {
+
+			//write prefix
+			n := binary.PutVarint(lenBuf[:], int64(len(item.prefix)))
+			buffer.Write(lenBuf[:n])
+			buffer.Write(item.prefix)
+
+			//write val
+			if item.value != nil {
+				data, err := marshaler(item.value)
+				if err != nil {
+					return 0, err
+				}
+				n := binary.PutVarint(lenBuf[:], int64(len(data)))
+				buffer.Write(lenBuf[:n])
+				buffer.Write(data)
+			}
+
+			if n, err := writer.Write(buffer.Bytes()); err != nil {
 				return 0, err
 			} else {
 				size += int64(n)
@@ -391,7 +441,7 @@ func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 			}
 		}
 		stack.pop()
-		if n, err := writer.Write(popText); err != nil {
+		if n, err := writer.Write(pop); err != nil {
 			return 0, err
 		} else {
 			size += int64(n)
@@ -400,33 +450,88 @@ func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 	return size, nil
 }
 
-func FastBuildTree(reader io.Reader) (*RTree, error) {
+func ReBuildTreeWithGzip(reader io.Reader, unMarshal func(data []byte) (interface{}, error)) (*Tree, error) {
+	reader, err := gzip.NewReader(reader)
+	if err != nil {
+		return nil, err
+	}
+	return ReBuildTree(reader, unMarshal)
+}
+
+func ReBuildTree(reader io.Reader, unMarshal func(data []byte) (interface{}, error)) (*Tree, error) {
+	type OpCode struct {
+		op     byte
+		prefix []byte
+		value  interface{}
+	}
+
 	const bufferSize = 1 << 10
 	var tree = New()
 	var stack = make([]*children, 0, 128)
 	var curr *children
-	var scanner = bufio.NewScanner(reader)
-	var tokensCh = make(chan [][]byte, 4<<10)
-	var buffer = make([][]byte, 0, bufferSize)
+	var opCodesCh = make(chan []OpCode, 4<<10)
+	var opCodes = make([]OpCode, 0, bufferSize)
+	var err error
+	bufReader := bufio.NewReader(reader)
+
+	readBytes := func() []byte {
+		var size int64
+		size, err = binary.ReadVarint(bufReader)
+		if err != nil {
+			return nil
+		}
+		prefix := make([]byte, size)
+		if _, err = io.ReadFull(bufReader, prefix); err != nil {
+			return nil
+		}
+		return prefix
+	}
 
 	go func() {
-		for scanner.Scan() {
-			data := scanner.Bytes()
-			k := make([]byte, len(data))
-			copy(k, data)
-			buffer = append(buffer, k)
-			if len(buffer) < bufferSize {
+		defer func() {
+			close(opCodesCh)
+		}()
+		var opCode [1]byte
+		for {
+			if _, err := bufReader.Read(opCode[:]); err != nil {
+				if err == io.EOF {
+					break
+				}
+			}
+			switch opCode[0] {
+			case Pop:
+				opCodes = append(opCodes, OpCode{op: Pop})
+			case Push, PushKey:
+				prefix := readBytes()
+				if prefix == nil {
+					return
+				}
+				if opCode[0] == Push {
+					opCodes = append(opCodes, OpCode{op: Push, prefix: prefix})
+					break
+				}
+				data := readBytes()
+				if data == nil {
+					return
+				}
+				var val interface{}
+				val, err = unMarshal(data)
+				if err != nil {
+					return
+				}
+				opCodes = append(opCodes, OpCode{op: Push, prefix: prefix, value: val})
+			}
+			if len(opCodes) < bufferSize {
 				continue
 			}
-			tokensCh <- buffer
-			buffer = make([][]byte, 0, bufferSize)
+			opCodesCh <- opCodes
+			opCodes = make([]OpCode, 0, bufferSize)
 		}
-		tokensCh <- buffer
-		close(tokensCh)
+		opCodesCh <- opCodes
 	}()
-	for tokens := range tokensCh {
-		for _, token := range tokens {
-			if token[0] == PushKey || token[0] == Push {
+	for tokens := range opCodesCh {
+		for _, opCode := range tokens {
+			if opCode.op == PushKey || opCode.op == Push {
 				if len(stack) == 0 {
 					stack = append(stack, &tree.children)
 					curr = &tree.children
@@ -436,49 +541,25 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 				if curr == nil {
 					return nil, fmt.Errorf("stack error")
 				}
-				next := newRNode(tree.cow, token[1:], token[0] == PushKey)
+				next := newRNode(tree.cow, opCode.prefix, opCode.value)
 				*curr = append(*curr, next)
 				curr = &next.children
-			} else if token[0] == Pop {
+			} else if opCode.op == Pop {
 				if len(stack) == 0 {
 					return nil, fmt.Errorf("stack error")
 				}
 				curr = stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
 			} else {
-				return nil, fmt.Errorf("unkown token %c", token[0])
+				return nil, fmt.Errorf("unkown opCode %c", opCode.op)
 			}
 		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	if len(stack) != 0 {
 		return nil, fmt.Errorf("broken stack")
 	}
 	return tree, nil
-
-}
-
-func BuildTree(reader io.Reader) (*RTree, error) {
-	var tree RTree
-	var stack []string
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		text := scanner.Text()
-		if text[0] == PushKey || text[0] == Push {
-			stack = append(stack, text[1:])
-			if text[0] == PushKey {
-				tree.Insert([]byte(strings.Join(stack, "")))
-			}
-		} else if text[0] == Pop {
-			if len(stack) == 0 {
-				return nil, fmt.Errorf("stack error")
-			}
-			stack = stack[:len(stack)-1]
-		} else {
-			return nil, fmt.Errorf("unkown token %c", text[0])
-		}
-	}
-	if len(stack) != 0 {
-		return nil, fmt.Errorf("broken stack")
-	}
-	return &tree, nil
 }
