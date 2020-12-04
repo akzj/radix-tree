@@ -245,6 +245,34 @@ func (tree Tree) Walk(f func(prefixes [][]byte, val interface{}) bool) {
 	tree.children.walk(make([][]byte, 0, 32), f)
 }
 
+func (tree Tree) WalkWithPrefix(prefix []byte, f func(prefixes [][]byte, val interface{}) bool) {
+	if len(prefix) == 0 {
+		tree.Walk(f)
+		return
+	}
+	stack := make([][]byte, 0, 32)
+	children := tree.children
+	for len(prefix) != 0 && len(children) != 0 {
+		if _, child := children.findNode(prefix[0]); child != nil {
+			size := prefixLen(child.prefix, prefix)
+			if bytes.Compare(child.prefix, prefix[:size]) == 0 {
+				stack = append(stack, child.prefix)
+				children = child.children
+				prefix = prefix[size:]
+				continue
+			}
+			if size == len(prefix) {
+				children = []*node{child}
+				break
+			}
+		}
+		return
+	}
+	if len(children) != 0 {
+		children.walk(stack, f)
+	}
+}
+
 func prefixLen(k1, k2 []byte) int {
 	max := len(k1)
 	if l := len(k2); l < max {

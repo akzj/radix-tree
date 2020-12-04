@@ -237,6 +237,59 @@ func TestChildrenInsertFindRebuildWrite(t *testing.T) {
 	}
 }
 
+func TestWalkWithPrefix(t *testing.T) {
+	cases := []struct {
+		inserts []string
+		prefix  string
+		expect  []string
+	}{{
+		inserts: []string{
+			"aaa",
+			"aab",
+			"aabc",
+			"aabcdd",
+			"aabcddff",
+			"aabcddffgg",
+		},
+		prefix: "aabc",
+		expect: []string{
+			"aabcdd",
+			"aabcddff",
+			"aabcddffgg",
+		},
+	},{
+		inserts: []string{
+			"aabcddff",
+			"aabcdffgg",
+			"aabcffgg",
+			"aabffgg",
+		},
+		prefix: "aabcd",
+		expect: []string{
+			"aabcddff",
+			"aabcdffgg",
+		},
+	}}
+
+	for _, Case := range cases {
+		tree := New()
+		for _, val := range Case.inserts {
+			tree.Insert([]byte(val))
+		}
+		var result []string
+		tree.WalkWithPrefix([]byte(Case.prefix), func(prefixes [][]byte, val interface{}) bool {
+			result = append(result, string(bytes.Join(prefixes, nil)))
+			return true
+		})
+		sort.Strings(result)
+		sort.Strings(Case.expect)
+		if reflect.DeepEqual(Case.expect, result) == false {
+			t.Errorf("no match \n%+v\n%+v\n", Case.expect, result)
+		}
+	}
+
+}
+
 func TestWriteRBtree(t *testing.T) {
 	f, err := os.Open("../files.txt")
 	if err != nil {
@@ -454,4 +507,3 @@ func BenchmarkAppend(b *testing.B) {
 		buffer = append(buffer, data...)
 	}
 }
-
