@@ -17,26 +17,23 @@ import (
 	"time"
 )
 
-func printTokens(bytesTokens [][]byte) {
-	var tokens []string
-	for _, token := range bytesTokens {
-		tokens = append(tokens, string(token))
+
+func printMemUsed() {
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		panic(err)
 	}
-	fmt.Println(tokens)
+	runtime.GC()
+	m, _ := p.MemoryInfo()
+	fmt.Println("MemoryInfo", m.RSS>>20)
 }
 
 func TestInsert(t *testing.T) {
 	keys := []string{
 		"acccc",
-		"accccbbbb",
-		"acccbbb",
-		"acccabb",
-		"acc",
-		"accc",
-		"bccc",
-		"b1cc",
+		"bcccc",
 	}
-	var tree RTree
+	var tree = New()
 	for _, it := range keys {
 		tree.Insert([]byte(it))
 	}
@@ -44,10 +41,25 @@ func TestInsert(t *testing.T) {
 		printTokens(prefixes)
 		return true
 	})
+
+	print("-----------\n")
+	clone := tree.Clone()
+
+	clone.Insert([]byte("acccb"))
+	clone.Insert([]byte("bcccb"))
+	clone.Walk(func(prefixes [][]byte) bool {
+		printTokens(prefixes)
+		return true
+	})
+	print("-----------\n")
+	tree.Walk(func(prefixes [][]byte) bool {
+		printTokens(prefixes)
+		return true
+	})
 }
 
 func TestRTreeDeleteMerge(t *testing.T) {
-	var tree RTree
+	var tree = New()
 	tree.Insert([]byte("aaa"))
 	tree.Insert([]byte("aaabbb"))
 	tree.Insert([]byte("aaaccc"))
@@ -76,14 +88,16 @@ func TestChildrenDelete(t *testing.T) {
 	}{
 		{
 			keys: []string{
+				"a",
 				"acc",
 				"acccc",
+				"ac",
 			},
 		},
 	}
 
 	for _, Case := range cases {
-		var tree RTree
+		var tree = New()
 		for _, val := range Case.keys {
 			fmt.Println(string(val))
 			tree.Insert([]byte(val))
@@ -110,29 +124,31 @@ func TestWriteRBtreeDelete(t *testing.T) {
 		t.Fatal(err.Error())
 	}
 	scanner := bufio.NewScanner(bufio.NewReader(f))
-	var tree = new(RTree)
-	var keys = map[string]string{}
+	var tree = New()
+	var keys [][]byte
 	for ; scanner.Scan(); {
-		text := scanner.Text()
-		tree.Insert([]byte(text))
-		keys[text] = text
+		text := scanner.Bytes()
+		data := make([]byte, len(text))
+		copy(data, text)
+		tree.Insert(data)
+		keys = append(keys, data)
 	}
 	f.Close()
 	f = nil
 	scanner = nil
+	printMemUsed()
 	begin := time.Now()
 	count := len(keys)
-	for str, key := range keys {
-		tree.Delete([]byte(key))
-		delete(keys, str)
+	for index, key := range keys {
+		tree.Delete(key)
+		keys[index] = nil
 	}
 	fmt.Println("delete/s ", int(float64(count)/time.Now().Sub(begin).Seconds()))
 	tree.Walk(func(prefixes [][]byte) bool {
 		printTokens(prefixes)
 		return true
 	})
-	keys = nil
-	tree = nil
+	printMemUsed()
 }
 
 func TestChildrenInsert(t *testing.T) {
@@ -167,7 +183,7 @@ func TestChildrenInsert(t *testing.T) {
 
 	for _, Case := range cases {
 		vals := Case.keys
-		var tree RTree
+		var tree = New()
 		for _, val := range vals {
 			tree.Insert([]byte(val))
 		}
@@ -215,7 +231,7 @@ func TestWriteRBtree(t *testing.T) {
 		t.Fatal(err.Error())
 	}
 	scanner := bufio.NewScanner(bufio.NewReader(f))
-	var tree RTree
+	var tree = New()
 	for ; scanner.Scan(); {
 		text := scanner.Bytes()
 		tree.Insert(text)
@@ -232,7 +248,7 @@ func TestWriteRBtree(t *testing.T) {
 		t.Fatal(err.Error())
 	}
 
-	writeString := func(tree RTree, filename string) {
+	writeString := func(tree *RTree, filename string) {
 		begin := time.Now()
 		defer func() {
 			fmt.Printf("write tree token seconds %0.3f", time.Now().Sub(begin).Seconds())
@@ -256,7 +272,7 @@ func TestWriteRBtree(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		writeString(*tree, "stack.txt2")
+		writeString(tree, "stack.txt2")
 	}
 
 }
@@ -282,13 +298,6 @@ func TestReloadRtree(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Printf("take time seconds %0.3f\n", time.Now().Sub(begin).Seconds())
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	runtime.GC()
-	m, _ := p.MemoryInfo()
-	fmt.Println("MemoryInfo", m.RSS>>20)
 }
 
 type text []byte
@@ -308,6 +317,7 @@ func TestBtree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
+	printMemUsed()
 	scanner := bufio.NewScanner(bufio.NewReader(f))
 	var count int
 	begin := time.Now()
@@ -317,21 +327,12 @@ func TestBtree(t *testing.T) {
 			tree.ReplaceOrInsert(newText(text))
 			count++
 		}
-		if count%100000 == 0 {
-			fmt.Println(count, int(float64(count)/time.Now().Sub(begin).Seconds()))
-		}
 	}
 	f.Close()
 	fmt.Println("done ", count)
 	fmt.Println("insert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
 
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	runtime.GC()
-	m, _ := p.MemoryInfo()
-	fmt.Println(m.RSS >> 20)
+	printMemUsed()
 
 	data, _ := ioutil.ReadFile("../files.txt")
 
@@ -364,30 +365,22 @@ func TestLoadFile(t *testing.T) {
 		t.Fatal(err.Error())
 	}
 	scanner := bufio.NewScanner(bufio.NewReader(f))
-	var tree RTree
+	var tree = New()
 	var count int
 	begin := time.Now()
+	printMemUsed()
 	for ; scanner.Scan(); {
 		text := scanner.Bytes()
 		if len(text) > 0 {
 			tree.Insert(text)
 			count++
 		}
-		if count%100000 == 0 {
-			fmt.Println(count, int(float64(count)/time.Now().Sub(begin).Seconds()))
-		}
 	}
 	f.Close()
 	fmt.Println("done ", count)
 	fmt.Println("insert/s", int(float64(count)/time.Now().Sub(begin).Seconds()))
+	printMemUsed()
 
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		t.Fatal(err.Error())
-	}
-	runtime.GC()
-	m, _ := p.MemoryInfo()
-	fmt.Println(m.RSS >> 20)
 
 	data, _ := ioutil.ReadFile("../files.txt")
 
@@ -454,3 +447,4 @@ func TestGzipTest(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+

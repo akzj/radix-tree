@@ -7,64 +7,112 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
-type Children []*RNode
+type FreeList struct {
+	mx    sync.Mutex
+	nodes []*node
+	size  int
+}
 
-type RNode struct {
+type CopyOnWriteContext struct {
+	freelist *FreeList
+}
+
+type children []*node
+
+type node struct {
 	key      bool
-	children Children
+	cow      *CopyOnWriteContext
+	children children
 	prefix   []byte
 }
 
 type RTree struct {
-	children Children
+	cow      *CopyOnWriteContext
+	children children
 }
+
+func NewFreeList(size int) *FreeList {
+	return &FreeList{
+		mx:    sync.Mutex{},
+		nodes: make([]*node, 0, size),
+		size:  size,
+	}
+}
+
+func (c *CopyOnWriteContext) newNode() *node {
+	n := c.freelist.newNode()
+	n.cow = c
+	return n
+}
+
+func (freelist *FreeList) newNode() *node {
+	var n *node
+	freelist.mx.Lock()
+	if size := len(freelist.nodes); size != 0 {
+		n = freelist.nodes[size-1]
+		freelist.nodes[size-1] = nil
+		freelist.nodes = freelist.nodes[:size-1]
+	}
+	freelist.mx.Unlock()
+	if n == nil {
+		return new(node)
+	}
+	return n
+}
+
+func (freelist *FreeList) freeNode(node *node) {
+	freelist.mx.Lock()
+	if size := len(freelist.nodes); size < freelist.size {
+		freelist.nodes = append(freelist.nodes, node)
+	}
+	freelist.mx.Lock()
+}
+
+var DefaultFreeListSize = 32
 
 func New() *RTree {
-	return &RTree{}
-}
-
-func newRNode(prefix []byte, key bool) *RNode {
-	return &RNode{
-		key:    key,
-		prefix: prefix,
+	return &RTree{
+		cow: &CopyOnWriteContext{freelist: NewFreeList(DefaultFreeListSize)},
 	}
 }
 
-func (children Children) walkWithStack(stack [][]byte, f func(key [][]byte) bool) bool {
-	for _, it := range children {
-		if it.key {
-			if f(append(stack, it.prefix)) == false {
-				return false
-			}
-		}
-		if it.children != nil {
-			if it.children.walkWithStack(append(stack, it.prefix), f) == false {
-				return false
-			}
-		}
-	}
-	return true
+func (tree *RTree) Clone() *RTree {
+	clone := *tree
+	cow1, cow2 := *tree.cow, *tree.cow
+	clone.children = make(children, len(tree.children))
+	copy(clone.children, tree.children)
+	clone.cow = &cow1
+	tree.cow = &cow2
+	return &clone
 }
 
-func (children Children) Print() {
+func newRNode(cow *CopyOnWriteContext, prefix []byte, key bool) *node {
+	n := cow.newNode()
+	n.prefix = prefix
+	n.key = key
+	return n
+}
+
+func (children children) Print() {
 	for _, child := range children {
 		fmt.Println(child.prefix)
 	}
 }
 
-func (children Children) FindNode(first byte) (int, *RNode) {
+func (children children) findNode(first byte) (int, *node) {
 	i := sort.Search(len(children), func(i int) bool {
 		return first < children[i].prefix[0]
 	})
 	if i > 0 && children[i-1].prefix[0] == first {
-		return i, children[i-1]
+		return i - 1, children[i-1]
 	}
 	return i, nil
 }
 
-func (children *Children) insetAt(node *RNode, index int) {
+func (children *children) insetAt(node *node, index int) {
 	*children = append(*children, nil)
 	if index < len(*children) {
 		copy((*children)[index+1:], (*children)[index:])
@@ -72,20 +120,23 @@ func (children *Children) insetAt(node *RNode, index int) {
 	(*children)[index] = node
 }
 
-func (children *Children) deleteAt(index int) {
+func (children *children) deleteAt(index int) {
 	copy((*children)[index:], (*children)[index+1:])
+	(*children)[len(*children)-1] = nil
 	*children = (*children)[:len(*children)-1]
 }
 
-func (children *Children) delete(key []byte) {
-	if index, child := children.FindNode(key[0]); child != nil {
+func (children *children) delete(cow *CopyOnWriteContext, key []byte) {
+	if index, child := children.findNode(key[0]); child != nil {
+		child = children.mutableChild(cow, index)
 		if len(key) < len(child.prefix) ||
 			bytes.Compare(key[:len(child.prefix)], child.prefix) != 0 {
 			return
 		}
 		if len(child.prefix) == len(key) {
 			if len(child.children) == 0 {
-				children.deleteAt(index - 1)
+				children.deleteAt(index)
+				child.prefix = nil
 			} else {
 				if len(child.children) == 1 {
 					child.merge()
@@ -98,19 +149,42 @@ func (children *Children) delete(key []byte) {
 		if len(child.children) == 0 {
 			return
 		}
-		child.children.delete(key[len(child.prefix):])
+		child.children.delete(cow, key[len(child.prefix):])
 		if len(child.children) == 1 && child.key == false {
 			child.merge()
 		}
 	}
 }
 
-func (node *RNode) find(key []byte) bool {
-	if node.key && bytes.Compare(node.prefix, key) == 0 {
+func (children *children) mutableChild(cow *CopyOnWriteContext, index int) *node {
+	c := (*children)[index]
+	if c.cow != cow {
+		c = c.mutableFor(cow)
+		(*children)[index] = c
+	}
+	return c
+}
+
+func (children children) walk(stack [][]byte, f func(prefixes [][]byte) bool) bool {
+	for _, child := range children {
+		if child.key {
+			if f(append(stack, child.prefix)) == false {
+				return false
+			}
+		}
+		if child.children.walk(append(stack, child.prefix), f) == false {
+			return false
+		}
+	}
+	return true
+}
+
+func (n *node) find(key []byte) bool {
+	if n.key && bytes.Compare(n.prefix, key) == 0 {
 		return true
 	}
-	key = key[len(node.prefix):]
-	if _, child := node.children.FindNode(key[0]); child == nil {
+	key = key[len(n.prefix):]
+	if _, child := n.children.findNode(key[0]); child == nil {
 		return false
 	} else {
 		return child.find(key)
@@ -118,35 +192,40 @@ func (node *RNode) find(key []byte) bool {
 }
 
 func (tree *RTree) Find(key []byte) bool {
-	if _, child := tree.children.FindNode(key[0]); child == nil {
+	if tree.children == nil || len(key) == 0 {
+		return false
+	}
+	if _, child := tree.children.findNode(key[0]); child == nil {
 		return false
 	} else {
 		return child.find(key)
 	}
 }
 
+func bytesCopy(data []byte) []byte {
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out
+}
+
 func (tree *RTree) Insert(key []byte) {
 	if len(key) == 0 {
 		return
 	}
-	index, child := tree.children.FindNode(key[0])
+	index, child := tree.children.findNode(key[0])
 	if child == nil {
-		k := make([]byte, len(key))
-		copy(k, key)
-		tree.children.insetAt(newRNode(k, true), index)
+		tree.children.insetAt(newRNode(tree.cow, key, true), index)
 	} else {
-		child.insert(key)
+		tree.children.mutableChild(tree.cow, index).insert(key)
 	}
 }
 
 func (tree *RTree) Delete(key []byte) {
-	if tree.children != nil && len(key) != 0 {
-		tree.children.delete(key)
-	}
+	tree.children.delete(tree.cow, key)
 }
 
 func (tree RTree) Walk(f func(prefixes [][]byte) bool) {
-	tree.children.walkWithStack(make([][]byte, 0, 32), f)
+	tree.children.walk(make([][]byte, 0, 32), f)
 }
 
 func prefixLen(k1, k2 []byte) int {
@@ -163,57 +242,90 @@ func prefixLen(k1, k2 []byte) int {
 	return i
 }
 
-func (node *RNode) insert(key []byte) {
-	if bytes.Compare(node.prefix, key) == 0 {
-		if node.key == false {
-			node.key = true
+func (n *node) mutableFor(cow *CopyOnWriteContext) *node {
+	if n.cow == cow {
+		return n
+	}
+	out := cow.newNode()
+	if cap(out.children) >= len(n.children) {
+		out.children = out.children[:len(n.children)]
+	} else {
+		out.children = make(children, len(n.children), cap(n.children))
+	}
+	if len(out.children) > 0 {
+		copy(out.children, n.children)
+	}
+	out.prefix = bytesCopy(n.prefix)
+	out.key = n.key
+	return out
+}
+
+func (n *node) mutableChild(i int) *node {
+	c := n.children[i].mutableFor(n.cow)
+	n.children[i] = c
+	return c
+}
+
+func printTokens(bytesTokens [][]byte) {
+	var tokens []string
+	for _, token := range bytesTokens {
+		tokens = append(tokens, string(token))
+	}
+	fmt.Println(tokens)
+}
+
+func (n *node) insert(key []byte) {
+	if bytes.Compare(n.prefix, key) == 0 {
+		if n.key == false {
+			n.key = true
 		} else {
 			//fmt.Println("repeated")
 		}
 		return
 	}
-	index := prefixLen(node.prefix, key)
-	if index == len(node.prefix) {
+	index := prefixLen(n.prefix, key)
+	if index == len(n.prefix) {
 		key = key[index:]
-		index, child := node.children.FindNode(key[0])
+		index, child := n.children.findNode(key[0])
 		if child == nil {
-			k := make([]byte, len(key))
-			copy(k, key)
-			node.children.insetAt(newRNode(k, true), index)
+			n.children.insetAt(newRNode(n.cow, bytesCopy(key), true), index)
 		} else {
-			child.insert(key)
+			n.mutableChild(index).insert(key)
 		}
 	} else {
-		child := *node
-		child.prefix = node.prefix[index:]
-		node.prefix = node.prefix[:index]
-		node.children = make(Children, 1)
-		node.children[0] = &child
-		node.key = false
+		child := *n
+		child.prefix = n.prefix[index:]
+		n.key = false
+		n.prefix = n.prefix[:index]
+		n.children = make(children, 1, 2)
+		n.children[0] = &child
 		key = key[index:]
 		if len(key) > 0 {
-			k := make([]byte, len(key))
-			copy(k, key)
-			rNode := newRNode(k, true)
-			index, _ := node.children.FindNode(key[0])
-			node.children.insetAt(rNode, index)
+			index, _ := n.children.findNode(key[0])
+			n.children.insetAt(newRNode(n.cow, bytesCopy(key), true), index)
 		} else {
-			node.key = true
+			n.key = true
 		}
 	}
 }
 
-func (node *RNode) merge() {
-	prefix := make([]byte, len(node.prefix)+len(node.children[0].prefix))
-	node.key = node.children[0].key
-	copy(prefix, node.prefix)
-	copy(prefix[len(node.prefix):], node.children[0].prefix)
-	node.prefix = prefix
-	node.children = node.children[0].children
+func (n *node) merge() {
+	prefix := make([]byte, len(n.prefix)+len(n.children[0].prefix))
+	n.key = n.children[0].key
+	copy(prefix, n.prefix)
+	copy(prefix[len(n.prefix):], n.children[0].prefix)
+	n.prefix = prefix
+	old := n.children
+	n.children = n.children[0].children
+	old[0] = nil
+}
+
+func (n *node) findNode(b byte) (int, *node) {
+	return n.children.findNode(b)
 }
 
 type stackItem struct {
-	*RNode
+	*node
 	visit bool
 }
 
@@ -238,9 +350,9 @@ func (s *stack) pop() *stackItem {
 	return rNode
 }
 
-func (s *stack) push(children Children) {
+func (s *stack) push(children ...*node) {
 	for i := len(children) - 1; i >= 0; i-- {
-		s.stack = append(s.stack, &stackItem{RNode: children[i]})
+		s.stack = append(s.stack, &stackItem{node: children[i]})
 	}
 }
 
@@ -252,10 +364,10 @@ const (
 
 func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 	var size int64
-	var stack = stack{}
+	var stack stack
 	var text bytes.Buffer
 	var popText = []byte{Pop, '\n'}
-	stack.push(tree.children)
+	stack.push(tree.children...)
 	for item := stack.peek(); item != nil; item = stack.peek() {
 		visit := item.visit
 		item.visit = true
@@ -274,7 +386,7 @@ func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 				size += int64(n)
 			}
 			if item.children != nil {
-				stack.push(item.children)
+				stack.push(item.children...)
 				continue
 			}
 		}
@@ -290,9 +402,9 @@ func (tree *RTree) WriteTo(writer io.Writer) (int64, error) {
 
 func FastBuildTree(reader io.Reader) (*RTree, error) {
 	const bufferSize = 1 << 10
-	var tree RTree
-	var stack = make([]*Children, 0, 128)
-	var curr *Children
+	var tree = New()
+	var stack = make([]*children, 0, 128)
+	var curr *children
 	var scanner = bufio.NewScanner(reader)
 	var tokensCh = make(chan [][]byte, 4<<10)
 	var buffer = make([][]byte, 0, bufferSize)
@@ -324,7 +436,7 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 				if curr == nil {
 					return nil, fmt.Errorf("stack error")
 				}
-				next := newRNode(token[1:], token[0] == PushKey)
+				next := newRNode(tree.cow, token[1:], token[0] == PushKey)
 				*curr = append(*curr, next)
 				curr = &next.children
 			} else if token[0] == Pop {
@@ -341,7 +453,7 @@ func FastBuildTree(reader io.Reader) (*RTree, error) {
 	if len(stack) != 0 {
 		return nil, fmt.Errorf("broken stack")
 	}
-	return &tree, nil
+	return tree, nil
 
 }
 
